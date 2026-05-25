@@ -1,23 +1,13 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiManager.h>
+#include <ArduinoOTA.h>
 #include <ESPmDNS.h>
 #include "esp_camera.h"
 #include "esp_http_server.h"
+#include "index_html.h"
 
-// ===== WiFi credentials — FILL THESE IN before flashing =====
-const char* ssid     = "Redmi Note 14 5G";
-const char* password = "12345678";
-
-// ===== Static IP config — pins the ESP to one address so it never changes =====
-// Adjust if your router's subnet is different. Your DHCP-assigned IPs were 192.168.1.x,
-// so gateway is almost certainly 192.168.1.1. Pick a host number outside your router's
-// DHCP pool (most home routers hand out .100–.200, so .220 is usually safe).
-IPAddress local_IP(192, 168, 1, 220);
-IPAddress gateway (192, 168, 1, 1);
-IPAddress subnet  (255, 255, 255, 0);
-IPAddress dns1    (8, 8, 8, 8);
-
-// mDNS name — after boot, you can also reach the cam at  http://esp32cam.local/
+// After boot the cam is reachable at  http://esp32cam.local/  on most networks.
 const char* mdns_hostname = "esp32cam";
 
 // ===== AI-Thinker ESP32-CAM pin map (OV2640) =====
@@ -45,70 +35,6 @@ static const char* _STREAM_PART         = "Content-Type: image/jpeg\r\nContent-L
 
 httpd_handle_t camera_httpd = NULL;
 httpd_handle_t stream_httpd = NULL;
-
-static const char PROGMEM INDEX_HTML[] = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>ESP32-CAM</title>
-  <style>
-    body { font-family: sans-serif; background:#111; color:#eee; margin:0; padding:20px; }
-    h1, h2 { font-weight: 500; }
-    .row { margin: 10px 0; display:flex; align-items:center; gap:10px; }
-    .row label { width: 110px; }
-    .row input[type=range] { flex:1; }
-    img { max-width: 100%; border:1px solid #444; }
-    select, button { padding:6px 10px; background:#222; color:#eee; border:1px solid #444; }
-    button:hover { background:#333; cursor:pointer; }
-  </style>
-</head>
-<body>
-  <h1>ESP32-CAM Stream</h1>
-
-  <div class="row">
-    <label>Resolution</label>
-    <select onchange="setVal('framesize', this.value)">
-      <option value="13">UXGA (1600x1200)</option>
-      <option value="12">SXGA (1280x1024)</option>
-      <option value="11">HD (1280x720)</option>
-      <option value="10">XGA (1024x768)</option>
-      <option value="9">SVGA (800x600)</option>
-      <option value="8" selected>VGA (640x480)</option>
-      <option value="5">QVGA (320x240)</option>
-      <option value="3">HQVGA (240x176)</option>
-      <option value="1">QQVGA (160x120)</option>
-    </select>
-  </div>
-
-  <div class="row"><label>Quality</label><input type="range" min="10" max="63" value="12" onchange="setVal('quality', this.value)"></div>
-  <div class="row"><label>Brightness</label><input type="range" min="-2" max="2" value="0" onchange="setVal('brightness', this.value)"></div>
-  <div class="row"><label>Contrast</label><input type="range" min="-2" max="2" value="0" onchange="setVal('contrast', this.value)"></div>
-  <div class="row"><label>Saturation</label><input type="range" min="-2" max="2" value="0" onchange="setVal('saturation', this.value)"></div>
-
-  <div class="row">
-    <label>H-Mirror</label><input type="checkbox" onchange="setVal('hmirror', this.checked?1:0)">
-    <label style="margin-left:20px;">V-Flip</label><input type="checkbox" onchange="setVal('vflip', this.checked?1:0)">
-  </div>
-
-  <div class="row">
-    <button onclick="document.getElementById('still').src='/capture?_='+Date.now()">Snapshot</button>
-  </div>
-
-  <h2>Live stream</h2>
-  <img id="stream" src="" />
-  <h2>Snapshot</h2>
-  <img id="still" />
-
-  <script>
-    function setVal(v, val){ fetch('/control?var=' + v + '&val=' + val); }
-    // Point the stream at port 81 (separate httpd instance) using the same host
-    document.getElementById('stream').src = 'http://' + location.hostname + ':81/stream';
-  </script>
-</body>
-</html>
-)rawliteral";
 
 static esp_err_t index_handler(httpd_req_t *req){
   httpd_resp_set_type(req, "text/html");
@@ -184,18 +110,32 @@ static esp_err_t control_handler(httpd_req_t *req){
   return httpd_resp_send(req, NULL, 0);
 }
 
+// /reset_wifi → erase saved creds and reboot into setup portal
+static esp_err_t reset_wifi_handler(httpd_req_t *req){
+  Serial.println("reset_wifi requested via web UI");
+  httpd_resp_set_type(req, "text/plain");
+  httpd_resp_send(req, "rebooting into setup mode", HTTPD_RESP_USE_STRLEN);
+  delay(500);
+  WiFi.disconnect(true, true);   // disconnect + erase stored creds from NVS
+  delay(200);
+  ESP.restart();
+  return ESP_OK;
+}
+
 void startCameraServer(){
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
 
-  httpd_uri_t index_uri   = { .uri="/",        .method=HTTP_GET, .handler=index_handler,   .user_ctx=NULL };
-  httpd_uri_t capture_uri = { .uri="/capture", .method=HTTP_GET, .handler=capture_handler, .user_ctx=NULL };
-  httpd_uri_t control_uri = { .uri="/control", .method=HTTP_GET, .handler=control_handler, .user_ctx=NULL };
+  httpd_uri_t index_uri      = { .uri="/",           .method=HTTP_GET, .handler=index_handler,      .user_ctx=NULL };
+  httpd_uri_t capture_uri    = { .uri="/capture",    .method=HTTP_GET, .handler=capture_handler,    .user_ctx=NULL };
+  httpd_uri_t control_uri    = { .uri="/control",    .method=HTTP_GET, .handler=control_handler,    .user_ctx=NULL };
+  httpd_uri_t reset_wifi_uri = { .uri="/reset_wifi", .method=HTTP_GET, .handler=reset_wifi_handler, .user_ctx=NULL };
 
   if (httpd_start(&camera_httpd, &config) == ESP_OK){
     httpd_register_uri_handler(camera_httpd, &index_uri);
     httpd_register_uri_handler(camera_httpd, &capture_uri);
     httpd_register_uri_handler(camera_httpd, &control_uri);
+    httpd_register_uri_handler(camera_httpd, &reset_wifi_uri);
   }
 
   // Stream gets its own port so a long-lived stream doesn't block control requests
@@ -205,6 +145,26 @@ void startCameraServer(){
   if (httpd_start(&stream_httpd, &config) == ESP_OK){
     httpd_register_uri_handler(stream_httpd, &stream_uri);
   }
+}
+
+void setupOTA(){
+  ArduinoOTA.setHostname(mdns_hostname);
+  ArduinoOTA
+    .onStart([](){
+      esp_camera_deinit();   // free PSRAM frame buffers before flash write
+      Serial.println("OTA: update starting...");
+    })
+    .onEnd([](){
+      Serial.println("\nOTA: update complete.");
+    })
+    .onProgress([](unsigned int p, unsigned int t){
+      Serial.printf("OTA: %u%%\r", (p * 100) / t);
+    })
+    .onError([](ota_error_t e){
+      Serial.printf("OTA error[%u]\n", e);
+    });
+  ArduinoOTA.begin();
+  Serial.println("OTA listener ready");
 }
 
 void setup(){
@@ -233,15 +193,14 @@ void setup(){
   config.pin_reset    = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  // PSRAM → big frame + double-buffer (smooth).  No PSRAM → tiny frame, single buffer.
   if (psramFound()){
-    config.frame_size   = FRAMESIZE_VGA;   // 640x480, the smooth sweet spot
+    config.frame_size   = FRAMESIZE_VGA;
     config.jpeg_quality = 12;
     config.fb_count     = 2;
     config.fb_location  = CAMERA_FB_IN_PSRAM;
     config.grab_mode    = CAMERA_GRAB_LATEST;
   } else {
-    config.frame_size   = FRAMESIZE_QVGA;  // 320x240, all DRAM can fit
+    config.frame_size   = FRAMESIZE_QVGA;
     config.jpeg_quality = 15;
     config.fb_count     = 1;
     config.fb_location  = CAMERA_FB_IN_DRAM;
@@ -253,38 +212,46 @@ void setup(){
     Serial.printf("Camera init failed: 0x%x\n", err);
     return;
   }
+  Serial.printf("PSRAM: %s | free PSRAM %u | free heap %u\n",
+                psramFound() ? "YES" : "NO",
+                (unsigned)ESP.getFreePsram(),
+                (unsigned)ESP.getFreeHeap());
 
-  Serial.printf("PSRAM found: %s\n", psramFound() ? "YES" : "NO");
-  Serial.printf("Free PSRAM:  %u bytes\n", (unsigned)ESP.getFreePsram());
-  Serial.printf("Free heap:   %u bytes\n", (unsigned)ESP.getFreeHeap());
+  // WiFiManager: tries saved creds first. If none / expired, opens AP
+  // "ESP32CAM_Setup" (password "cam12345"). User joins it from phone or
+  // laptop, picks their WiFi from the dropdown, types its password.
+  // The new creds are saved to NVS and the ESP reconnects.
+  WiFiManager wm;
+  wm.setHostname(mdns_hostname);
+  wm.setTitle("ESP32-CAM Setup");
+  wm.setConfigPortalTimeout(180);   // 3 min idle → reboot and retry
 
-  // Static IP disabled while on phone hotspot — re-enable when back on a known router.
-  // if (!WiFi.config(local_IP, gateway, subnet, dns1)){
-  //   Serial.println("Static IP config failed; falling back to DHCP.");
-  // }
-  WiFi.begin(ssid, password);
-  WiFi.setSleep(false);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED){
-    delay(500);
-    Serial.print(".");
+  Serial.println("Trying saved WiFi...");
+  Serial.println("If none, join AP 'ESP32CAM_Setup' (password 'cam12345') to configure.");
+
+  if (!wm.autoConnect("ESP32CAM_Setup", "cam12345")){
+    Serial.println("Portal timed out, restarting.");
+    delay(1000);
+    ESP.restart();
   }
-  Serial.println();
+  WiFi.setSleep(false);
 
   if (MDNS.begin(mdns_hostname)){
     MDNS.addService("http", "tcp", 80);
-    Serial.printf("mDNS started:  http://%s.local/\n", mdns_hostname);
-  } else {
-    Serial.println("mDNS start failed.");
+    Serial.printf("mDNS: http://%s.local/\n", mdns_hostname);
   }
 
-  Serial.print("WiFi connected. Open http://");
+  setupOTA();
+
+  Serial.printf("Connected to: %s  (RSSI %d dBm)\n", WiFi.SSID().c_str(), WiFi.RSSI());
+  Serial.print("Stream:       http://");
   Serial.print(WiFi.localIP());
-  Serial.println("/  in your browser.");
+  Serial.println("/");
 
   startCameraServer();
 }
 
 void loop(){
-  delay(10000);
+  ArduinoOTA.handle();
+  delay(50);
 }
