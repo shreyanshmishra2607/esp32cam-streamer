@@ -10,6 +10,51 @@
 // After boot the cam is reachable at  http://esp32cam.local/  on most networks.
 const char* mdns_hostname = "esp32cam";
 
+// Injected into the <head> of every WiFiManager portal page.  The script
+// detects the default "Trying to connect..." save-confirmation page and
+// replaces it with a friendly success screen telling the user what to do
+// next.  Plain styling so it looks consistent on phones and laptops.
+static const char PORTAL_HEAD_EXTRA[] PROGMEM = R"(
+<style>
+  body { font-family: -apple-system, sans-serif; background:#111; color:#eee; margin:0; padding:16px; }
+  h1, h2, h3 { font-weight:500; }
+  .saved-card { padding:24px; background:#1a2a1a; border:1px solid #3a7a3a; border-radius:8px; max-width:520px; margin:20px auto; }
+  .saved-card h2 { color:#7adb7a; margin-top:0; }
+  .saved-card a.cam-link { display:inline-block; padding:10px 16px; background:#000; color:#7adb7a; border-radius:4px; font-size:16px; text-decoration:none; font-family:monospace; }
+  .saved-card a.cam-link:hover { background:#222; }
+  .saved-card #countdown { color:#7adb7a; font-weight:bold; }
+  a, a:visited { color:#7ad; }
+</style>
+<script>
+  document.addEventListener('DOMContentLoaded', function() {
+    if (document.body.innerText.indexOf('Trying to connect ESP') < 0) return;
+
+    var target = 'http://esp32cam.local/';
+    document.body.innerHTML =
+      '<div class="saved-card">'
+      + '<h2>&#10003; WiFi saved</h2>'
+      + '<p>The camera is now joining your WiFi. This takes about 10 seconds.</p>'
+      + '<p>This page will open the camera automatically in <span id="countdown">30</span> seconds.</p>'
+      + '<p style="text-align:center; margin:24px 0;">'
+      +   '<a class="cam-link" href="' + target + '">' + target + '</a>'
+      + '</p>'
+      + '<p style="font-size:13px; color:#aaa;">'
+      +   'You may briefly see &quot;can&apos;t connect&quot; while your phone switches back to your normal WiFi. '
+      +   'That is normal &mdash; wait a few seconds and refresh, or tap the link above.'
+      + '</p>'
+      + '</div>';
+
+    var n = 30;
+    var el = document.getElementById('countdown');
+    var t = setInterval(function() {
+      n--;
+      if (el) el.textContent = n;
+      if (n <= 0) { clearInterval(t); window.location.href = target; }
+    }, 1000);
+  });
+</script>
+)";
+
 // ===== AI-Thinker ESP32-CAM pin map (OV2640) =====
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
@@ -172,6 +217,15 @@ void setup(){
   Serial.setDebugOutput(true);
   Serial.println();
 
+  // Pulse PWDN before camera init so the OV2640 starts from a clean state.
+  // SW reset (ESP.restart) does NOT power-cycle the sensor — only this does.
+  // Without this, the camera often fails with 0x105 NOT_FOUND after a reboot.
+  pinMode(PWDN_GPIO_NUM, OUTPUT);
+  digitalWrite(PWDN_GPIO_NUM, HIGH);   // power down
+  delay(10);
+  digitalWrite(PWDN_GPIO_NUM, LOW);    // power back up
+  delay(100);                          // let the sensor stabilize
+
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer   = LEDC_TIMER_0;
@@ -208,28 +262,30 @@ void setup(){
   }
 
   esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK){
-    Serial.printf("Camera init failed: 0x%x\n", err);
-    return;
+  bool camera_ok = (err == ESP_OK);
+  if (!camera_ok){
+    Serial.printf("Camera init failed: 0x%x  (continuing without camera so WiFi + OTA still come up)\n", err);
   }
   Serial.printf("PSRAM: %s | free PSRAM %u | free heap %u\n",
                 psramFound() ? "YES" : "NO",
                 (unsigned)ESP.getFreePsram(),
                 (unsigned)ESP.getFreeHeap());
 
-  // WiFiManager: tries saved creds first. If none / expired, opens AP
-  // "ESP32CAM_Setup" (password "cam12345"). User joins it from phone or
-  // laptop, picks their WiFi from the dropdown, types its password.
-  // The new creds are saved to NVS and the ESP reconnects.
+  // WiFiManager: tries saved creds first. If none / expired, opens an
+  // OPEN access point named "ESP32CAM_Setup" (no password). Most modern
+  // phones auto-pop the captive-portal browser when joining an open
+  // network. User picks their WiFi, types its password — creds get saved
+  // to NVS and the ESP reconnects.
   WiFiManager wm;
   wm.setHostname(mdns_hostname);
   wm.setTitle("ESP32-CAM Setup");
-  wm.setConfigPortalTimeout(180);   // 3 min idle → reboot and retry
+  wm.setCustomHeadElement(PORTAL_HEAD_EXTRA);
+  wm.setConfigPortalTimeout(0);     // no timeout — portal stays open until user pairs it
 
   Serial.println("Trying saved WiFi...");
-  Serial.println("If none, join AP 'ESP32CAM_Setup' (password 'cam12345') to configure.");
+  Serial.println("If none, join open AP 'ESP32CAM_Setup' (no password) to configure.");
 
-  if (!wm.autoConnect("ESP32CAM_Setup", "cam12345")){
+  if (!wm.autoConnect("ESP32CAM_Setup")){
     Serial.println("Portal timed out, restarting.");
     delay(1000);
     ESP.restart();
@@ -244,6 +300,7 @@ void setup(){
   setupOTA();
 
   Serial.printf("Connected to: %s  (RSSI %d dBm)\n", WiFi.SSID().c_str(), WiFi.RSSI());
+  Serial.printf("Camera:       %s\n", camera_ok ? "OK" : "FAILED — stream/capture will 500 until next reboot");
   Serial.print("Stream:       http://");
   Serial.print(WiFi.localIP());
   Serial.println("/");
