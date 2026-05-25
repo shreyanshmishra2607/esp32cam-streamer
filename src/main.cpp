@@ -155,6 +155,49 @@ static esp_err_t control_handler(httpd_req_t *req){
   return httpd_resp_send(req, NULL, 0);
 }
 
+// /stats → JSON snapshot of chip health, WiFi link, and memory.
+// Polled by the dashboard panel on the stream page every ~2 seconds.
+static esp_err_t stats_handler(httpd_req_t *req){
+  char buf[640];
+  int rssi = WiFi.RSSI();
+  IPAddress ip = WiFi.localIP();
+  String ssid = WiFi.SSID();
+  String mac  = WiFi.macAddress();
+  uint32_t uptime_s = millis() / 1000;
+  float temp_c = temperatureRead();    // Internal die temp — rough (+-5C) but useful as trend.
+
+  int len = snprintf(buf, sizeof(buf),
+    "{"
+    "\"chip\":\"%s\","
+    "\"cores\":%u,"
+    "\"cpu_mhz\":%u,"
+    "\"temp_c\":%.1f,"
+    "\"free_heap\":%u,"
+    "\"free_psram\":%u,"
+    "\"uptime_s\":%u,"
+    "\"wifi_ssid\":\"%s\","
+    "\"wifi_rssi\":%d,"
+    "\"ip\":\"%s\","
+    "\"mac\":\"%s\""
+    "}",
+    ESP.getChipModel(),
+    (unsigned)ESP.getChipCores(),
+    (unsigned)ESP.getCpuFreqMHz(),
+    temp_c,
+    (unsigned)ESP.getFreeHeap(),
+    (unsigned)ESP.getFreePsram(),
+    (unsigned)uptime_s,
+    ssid.c_str(),
+    rssi,
+    ip.toString().c_str(),
+    mac.c_str()
+  );
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, buf, len);
+}
+
 // /reset_wifi → erase saved creds and reboot into setup portal
 static esp_err_t reset_wifi_handler(httpd_req_t *req){
   Serial.println("reset_wifi requested via web UI");
@@ -174,12 +217,14 @@ void startCameraServer(){
   httpd_uri_t index_uri      = { .uri="/",           .method=HTTP_GET, .handler=index_handler,      .user_ctx=NULL };
   httpd_uri_t capture_uri    = { .uri="/capture",    .method=HTTP_GET, .handler=capture_handler,    .user_ctx=NULL };
   httpd_uri_t control_uri    = { .uri="/control",    .method=HTTP_GET, .handler=control_handler,    .user_ctx=NULL };
+  httpd_uri_t stats_uri      = { .uri="/stats",      .method=HTTP_GET, .handler=stats_handler,      .user_ctx=NULL };
   httpd_uri_t reset_wifi_uri = { .uri="/reset_wifi", .method=HTTP_GET, .handler=reset_wifi_handler, .user_ctx=NULL };
 
   if (httpd_start(&camera_httpd, &config) == ESP_OK){
     httpd_register_uri_handler(camera_httpd, &index_uri);
     httpd_register_uri_handler(camera_httpd, &capture_uri);
     httpd_register_uri_handler(camera_httpd, &control_uri);
+    httpd_register_uri_handler(camera_httpd, &stats_uri);
     httpd_register_uri_handler(camera_httpd, &reset_wifi_uri);
   }
 

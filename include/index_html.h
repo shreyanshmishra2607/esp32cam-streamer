@@ -22,6 +22,13 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     button:hover { background:#333; cursor:pointer; }
     button.danger { background:#3a1a1a; border-color:#7a3030; }
     button.danger:hover { background:#5a2424; }
+    .stats { display:grid; grid-template-columns:max-content 1fr; column-gap:16px; row-gap:6px; background:#1a1a1a; padding:14px 18px; border:1px solid #333; border-radius:6px; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:13px; }
+    .stats .k { color:#888; }
+    .stats .v { color:#eee; }
+    .pill { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px; }
+    .pill.good { background:#1a3a1a; color:#7adb7a; }
+    .pill.ok   { background:#3a3a1a; color:#dbd97a; }
+    .pill.bad  { background:#3a1a1a; color:#db7a7a; }
   </style>
 </head>
 <body>
@@ -62,6 +69,9 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
   <h2>Snapshot</h2>
   <img id="still" />
 
+  <h2>Device stats</h2>
+  <div id="stats" class="stats">Loading&hellip;</div>
+
   <script>
     function setVal(v, val){ fetch('/control?var=' + v + '&val=' + val); }
     function resetWifi(){
@@ -72,6 +82,53 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
     }
     // Stream comes from port 81 (separate httpd instance) on the same host
     document.getElementById('stream').src = 'http://' + location.hostname + ':81/stream';
+
+    function fmtKB(b){ return (b/1024).toFixed(0) + ' KB'; }
+    function rssiPill(r){
+      var cls = r >= -60 ? 'good' : (r >= -75 ? 'ok' : 'bad');
+      var label = r >= -50 ? 'excellent' : (r >= -60 ? 'good' : (r >= -70 ? 'fair' : 'weak'));
+      return '<span class="pill ' + cls + '">' + r + ' dBm &middot; ' + label + '</span>';
+    }
+    function tempPill(t){
+      var cls = t < 60 ? 'good' : (t < 75 ? 'ok' : 'bad');
+      return '<span class="pill ' + cls + '">' + t.toFixed(1) + ' &deg;C</span>';
+    }
+    function fmtUptime(s){
+      var d = Math.floor(s/86400), h = Math.floor((s%86400)/3600), m = Math.floor((s%3600)/60), x = s%60;
+      if (d) return d+'d '+h+'h '+m+'m';
+      if (h) return h+'h '+m+'m';
+      if (m) return m+'m '+x+'s';
+      return x+'s';
+    }
+    function rows(o){
+      var html = '';
+      for (var i=0; i<o.length; i++){
+        html += '<div class="k">' + o[i][0] + '</div><div class="v">' + o[i][1] + '</div>';
+      }
+      return html;
+    }
+    function loadStats(){
+      fetch('/stats', { cache:'no-store' })
+        .then(function(r){ return r.json(); })
+        .then(function(s){
+          document.getElementById('stats').innerHTML = rows([
+            ['WiFi',       s.wifi_ssid],
+            ['Signal',     rssiPill(s.wifi_rssi)],
+            ['IP',         s.ip],
+            ['MAC',        s.mac],
+            ['Chip',       s.chip + ' &middot; ' + s.cores + ' cores @ ' + s.cpu_mhz + ' MHz'],
+            ['Temperature', tempPill(s.temp_c)],
+            ['Free heap',  fmtKB(s.free_heap)],
+            ['Free PSRAM', fmtKB(s.free_psram)],
+            ['Uptime',     fmtUptime(s.uptime_s)]
+          ]);
+        })
+        .catch(function(){
+          document.getElementById('stats').innerHTML = '<span class="k">stats unavailable</span>';
+        });
+    }
+    loadStats();
+    setInterval(loadStats, 2000);
   </script>
 </body>
 </html>
