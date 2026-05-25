@@ -6,3 +6,9 @@
 
 # Personal research notes — private, never commit
 shreyansh-*-research.md
+
+# Python detector server
+server/.venv/
+server/captures/
+server/__pycache__/
+**/*.pyc
