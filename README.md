@@ -92,6 +92,56 @@ Arduino IDE expects a folder whose name matches the `.ino` file. So:
 
 Same dance: GPIO0 → GND jumper, plug in FTDI, click Upload, watch it write, remove jumper, press RST. Arduino IDE does not have an OTA-by-default workflow as clean as PlatformIO's — for OTA you'd run espota.py manually (Tools menu, after Sketch → Export Compiled Binary). PlatformIO does this in one click. **Recommendation: use PlatformIO for the OTA workflow.**
 
+## Dependencies & build commands
+
+There's no separate `requirements.txt` or `package.json` for this project — **`platformio.ini` is the manifest.** PlatformIO reads it, downloads the right toolchain version, the right framework, the right libraries, and caches them. Same role as those files in other ecosystems.
+
+Pinned versions:
+
+| Component | Pinned version |
+|---|---|
+| Espressif 32 platform | `~7.0.1` (any 7.0.x patch) |
+| Arduino framework | bundled with the platform (3.20017) |
+| WiFiManager (tzapu) | `^2.0.17` (latest 2.x) |
+| ArduinoOTA, ESPmDNS, WiFi | bundled with the Arduino framework |
+
+### One-liner build (no IDE needed)
+
+If you have PlatformIO CLI installed (`pip install platformio` or via the VS Code extension), this is all you need from a fresh clone:
+
+```
+git clone https://github.com/shreyanshmishra2607/esp32cam-streamer.git
+cd esp32cam-streamer
+pio run                # downloads dependencies + builds both envs
+```
+
+The first run installs the platform + libraries (~5 minutes the very first time, cached after). Subsequent builds are seconds.
+
+### Common commands
+
+| Command | What it does |
+|---|---|
+| `pio run` | Builds every env defined in `platformio.ini`. |
+| `pio run -e esp32cam` | Builds only the cable-upload env. |
+| `pio run -e esp32cam -t upload` | Builds + flashes over USB (requires the FTDI dance, see below). |
+| `pio run -e esp32cam_ota -t upload` | Builds + flashes over WiFi to a running cam. |
+| `pio device monitor` | Opens the serial monitor on the auto-detected COM port at 115200 baud. |
+| `pio pkg install` | Installs/refreshes dependencies without building. |
+| `pio run -t clean` | Wipes the build cache (`.pio/build/`). |
+| `pio system prune` | Frees disk space — removes unused PlatformIO caches. |
+
+### How dependency resolution works here
+
+When you (or any dev) runs `pio run` for the first time, PlatformIO:
+
+1. Reads `platformio.ini` → sees `platform = espressif32 @ ~7.0.1`.
+2. Downloads that platform and its toolchain (Xtensa GCC, esptool, mkspiffs, etc.) into `~/.platformio/`.
+3. Reads `lib_deps = tzapu/WiFiManager @ ^2.0.17`.
+4. Pulls that library from the PlatformIO Library Registry, caches it.
+5. Compiles. Done.
+
+If you change `lib_deps` to add another library, PlatformIO installs it on the next build. There's nothing to manually `pip install` or `npm install`.
+
 ## First flash (cable, one time only)
 
 You only need the cable for the very first firmware upload. After that, every update is wireless.
