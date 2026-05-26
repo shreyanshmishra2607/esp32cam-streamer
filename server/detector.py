@@ -19,10 +19,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Iterator
 
 import cv2
 import numpy as np
@@ -33,14 +35,27 @@ import requests
 CANNY_LOW = 50
 CANNY_HIGH = 150
 HOUGH_THRESHOLD = 60          # min votes for Hough to accept a line
-MIN_LINE_LENGTH = 80          # pixel length below this is ignored
+MIN_LINE_LENGTH = 100         # pixel length below this is ignored
 MAX_LINE_GAP = 10             # join collinear segments closer than this
 MIN_LINES_FOR_CRACK = 2       # how many qualifying lines trigger an alert
-# Reject any line whose angle is within this many degrees of perfectly
-# horizontal or vertical — kills false positives from picture frames,
-# door frames, window frames, tile grout, table edges, etc. Real cracks
-# meander and rarely fall on axis. Set to 0 to disable the filter.
+
+# --- Layer-1 filters that suppress false positives ---
+# 1) Reject any line within this many degrees of perfectly horizontal/vertical.
+#    Kills picture frames, door/window frames, tile grout, table edges, etc.
+#    Real cracks meander and rarely fall on axis. Set to 0 to disable.
 AXIS_REJECT_TOLERANCE_DEG = 12
+# 2) Reject any line whose midpoint is outside the central [margin, 1-margin]
+#    region of the frame. Edges of the frame are dominated by ceiling/floor
+#    lines, picture frames and shelving, none of which are cracks.
+ROI_MARGIN = 0.1
+# 3) Reject any line whose pixel brightness isn't notably darker than the
+#    parallel band ~PERP_OFFSET px to either side. Real cracks are darker
+#    than the wall they're on; window edges, painted lines, and seams often
+#    aren't. This is the single most powerful filter — it kills picture
+#    frames even when they're rotated off-axis.
+DARK_CONTRAST_MIN = 18        # required mean-brightness drop (0-255 gray)
+DARK_PERP_OFFSET = 4          # px to either side of the line we sample for comparison
+DARK_SAMPLES = 20             # number of points along the line we sample
 # ----------------------------------------------------------------------
 
 # ---------- archival policy ----------
@@ -104,17 +119,76 @@ def _is_axis_aligned(x1: int, y1: int, x2: int, y2: int) -> bool:
     angle = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
     if angle > 90:
         angle = 180 - angle
-    # angle is now in [0, 90]; 0 = horizontal, 90 = vertical
     return angle < AXIS_REJECT_TOLERANCE_DEG or angle > (90 - AXIS_REJECT_TOLERANCE_DEG)
+
+
+def _is_outside_roi(x1: int, y1: int, x2: int, y2: int, w: int, h: int) -> bool:
+    """True if the line's midpoint is outside the central ROI box."""
+    if ROI_MARGIN <= 0:
+        return False
+    mx = (x1 + x2) / 2.0
+    my = (y1 + y2) / 2.0
+    return not (
+        w * ROI_MARGIN <= mx <= w * (1.0 - ROI_MARGIN)
+        and h * ROI_MARGIN <= my <= h * (1.0 - ROI_MARGIN)
+    )
+
+
+def _is_darker_than_neighbors(gray: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> bool:
+    """True if the line is notably darker than the parallel bands a few px to either side.
+
+    Picture frames and door edges fail this — their "line" is the boundary between
+    two regions of similar brightness, not a thin dark mark on lighter material.
+    Real cracks pass it.
+    """
+    if DARK_CONTRAST_MIN <= 0:
+        return True
+    h, w = gray.shape[:2]
+    dx, dy = (x2 - x1), (y2 - y1)
+    length = float(np.hypot(dx, dy))
+    if length < 1.0:
+        return False
+    # Unit perpendicular vector
+    nx, ny = -dy / length, dx / length
+
+    line_total = 0
+    line_n = 0
+    side_total = 0
+    side_n = 0
+    for i in range(DARK_SAMPLES):
+        t = i / max(1, DARK_SAMPLES - 1)
+        cx, cy = x1 + t * dx, y1 + t * dy
+
+        ix, iy = int(cx), int(cy)
+        if 0 <= ix < w and 0 <= iy < h:
+            line_total += int(gray[iy, ix])
+            line_n += 1
+
+        for sign in (+1, -1):
+            sx = int(cx + sign * nx * DARK_PERP_OFFSET)
+            sy = int(cy + sign * ny * DARK_PERP_OFFSET)
+            if 0 <= sx < w and 0 <= sy < h:
+                side_total += int(gray[sy, sx])
+                side_n += 1
+
+    if line_n == 0 or side_n == 0:
+        return False
+    line_mean = line_total / line_n
+    side_mean = side_total / side_n
+    return (side_mean - line_mean) >= DARK_CONTRAST_MIN
 
 
 def detect_crack(img: np.ndarray) -> tuple[bool, np.ndarray, int]:
     """Return (is_crack, annotated_image, qualifying_line_count).
 
-    Lines that are nearly horizontal or vertical are drawn in dim grey so
-    you can see what was rejected; lines that qualify as crack-like are
-    drawn in red.
+    Lines are color-coded by rejection reason so it's visible what each
+    filter caught:
+        red    = passed all filters (counted as crack-like)
+        grey   = rejected: axis-aligned (frames, edges, grout)
+        teal   = rejected: outside the central ROI (frame periphery)
+        cyan   = rejected: not darker than neighbors (lighting boundary, not a crack)
     """
+    h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blur, CANNY_LOW, CANNY_HIGH)
@@ -129,6 +203,12 @@ def detect_crack(img: np.ndarray) -> tuple[bool, np.ndarray, int]:
     )
 
     annotated = img.copy()
+
+    # Draw the ROI box so you can see what region is being considered
+    if ROI_MARGIN > 0:
+        mx, my = int(w * ROI_MARGIN), int(h * ROI_MARGIN)
+        cv2.rectangle(annotated, (mx, my), (w - mx, h - my), (40, 200, 200), 1)
+
     qualifying = 0
     if lines is not None:
         for line in lines:
@@ -136,14 +216,64 @@ def detect_crack(img: np.ndarray) -> tuple[bool, np.ndarray, int]:
             length = float(np.hypot(x2 - x1, y2 - y1))
             if length < MIN_LINE_LENGTH:
                 continue
+
             if _is_axis_aligned(x1, y1, x2, y2):
-                # Draw rejected lines in dim grey so we can see what the filter caught
                 cv2.line(annotated, (x1, y1), (x2, y2), (60, 60, 60), 1)
                 continue
+            if _is_outside_roi(x1, y1, x2, y2, w, h):
+                cv2.line(annotated, (x1, y1), (x2, y2), (120, 120, 0), 1)
+                continue
+            if not _is_darker_than_neighbors(gray, x1, y1, x2, y2):
+                cv2.line(annotated, (x1, y1), (x2, y2), (0, 120, 120), 1)
+                continue
+
             qualifying += 1
             cv2.line(annotated, (x1, y1), (x2, y2), (0, 0, 255), 2)
 
     return qualifying >= MIN_LINES_FOR_CRACK, annotated, qualifying
+
+
+def stream_mjpeg(url: str, connect_timeout: float = 5.0) -> Iterator[bytes]:
+    """Yield raw JPEG frames from an MJPEG (multipart/x-mixed-replace) stream.
+
+    Uses `requests` + a tiny multipart parser instead of cv2.VideoCapture.
+    OpenCV's FFmpeg backend has known compatibility gaps with the
+    ESP32-CAM's stream format on some Windows builds; this path is bulletproof.
+    """
+    with requests.get(url, stream=True, timeout=(connect_timeout, None)) as r:
+        r.raise_for_status()
+        ctype = r.headers.get("Content-Type", "")
+        m = re.search(r"boundary=([^\s;]+)", ctype, re.IGNORECASE)
+        if not m:
+            raise RuntimeError(f"no multipart boundary in Content-Type: {ctype!r}")
+        boundary = b"--" + m.group(1).encode()
+
+        buf = b""
+        for chunk in r.iter_content(chunk_size=8192):
+            if not chunk:
+                continue
+            buf += chunk
+            while True:
+                bidx = buf.find(boundary)
+                if bidx < 0:
+                    break
+                hdr_start = bidx + len(boundary)
+                hdr_end = buf.find(b"\r\n\r\n", hdr_start)
+                if hdr_end < 0:
+                    break
+                headers = buf[hdr_start:hdr_end].decode("latin-1", errors="ignore")
+                clen_match = re.search(r"content-length:\s*(\d+)", headers, re.IGNORECASE)
+                if not clen_match:
+                    # malformed part — skip past it
+                    buf = buf[hdr_end + 4:]
+                    continue
+                clen = int(clen_match.group(1))
+                payload_start = hdr_end + 4
+                payload_end = payload_start + clen
+                if len(buf) < payload_end:
+                    break  # need more bytes
+                yield buf[payload_start:payload_end]
+                buf = buf[payload_end:]
 
 
 def fetch_capture(url: str, timeout: float = 5.0) -> np.ndarray | None:
@@ -160,7 +290,7 @@ def fetch_capture(url: str, timeout: float = 5.0) -> np.ndarray | None:
 
 def run_stream(base_url: str, raw_dir: Path, crack_dir: Path, show: bool,
                tg_token: str | None, tg_chat: str | None) -> None:
-    """Consume the cam's MJPEG stream at port 81 — high FPS, low latency."""
+    """Consume the cam's MJPEG stream at port 81 via a plain requests+parser path."""
     stream_url = f"{base_url}:81/stream"
     print(f"Streaming from {stream_url}")
     print(f"Output:        {raw_dir.parent}")
@@ -168,57 +298,63 @@ def run_stream(base_url: str, raw_dir: Path, crack_dir: Path, show: bool,
     print(f"Telegram:      {'ON' if tg_token and tg_chat else 'OFF (no token / chat id)'}")
     print("-" * 60)
 
-    cap = cv2.VideoCapture(stream_url)
-    if not cap.isOpened():
-        print(f"Could not open {stream_url}", file=sys.stderr)
-        sys.exit(1)
-
     last_raw_save = 0.0
     last_crack_save = 0.0
     last_tg_send = 0.0
+    frame_count = 0
+    last_log = time.time()
 
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret or frame is None:
-                # MJPEG stream hiccup — reconnect
-                cap.release()
-                time.sleep(1.0)
-                cap = cv2.VideoCapture(stream_url)
-                continue
+            try:
+                for jpeg_bytes in stream_mjpeg(stream_url):
+                    arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+                    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                    if frame is None:
+                        continue
 
-            now = time.time()
-            is_crack, annotated, n_lines = detect_crack(frame)
-            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+                    now = time.time()
+                    is_crack, annotated, n_lines = detect_crack(frame)
+                    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+                    frame_count += 1
 
-            if now - last_raw_save >= RAW_SAVE_EVERY_S:
-                cv2.imwrite(str(raw_dir / f"{ts}.jpg"), frame)
-                last_raw_save = now
+                    # Heartbeat log every 5 seconds so you see progress even when clean
+                    if now - last_log >= 5.0:
+                        fps = frame_count / (now - last_log)
+                        print(f"[{ts}]  streaming  ({fps:.1f} fps)")
+                        frame_count = 0
+                        last_log = now
 
-            if is_crack and now - last_crack_save >= CRACK_COOLDOWN_S:
-                crack_path = crack_dir / f"{ts}.jpg"
-                cv2.imwrite(str(crack_path), annotated)
-                print(f"[{ts}]  *** CRACK ***  ({n_lines} line{'s' if n_lines != 1 else ''})  -> cracks/{ts}.jpg")
-                last_crack_save = now
+                    if now - last_raw_save >= RAW_SAVE_EVERY_S:
+                        cv2.imwrite(str(raw_dir / f"{ts}.jpg"), frame)
+                        last_raw_save = now
 
-                if tg_token and tg_chat and now - last_tg_send >= TELEGRAM_COOLDOWN_S:
-                    ok, jpg = cv2.imencode(".jpg", annotated)
-                    if ok and telegram_send_photo(
-                        tg_token, tg_chat, jpg.tobytes(),
-                        caption=f"Crack detected — {n_lines} line(s) at {ts}",
-                    ):
-                        print(f"           telegram alert sent")
-                        last_tg_send = now
+                    if is_crack and now - last_crack_save >= CRACK_COOLDOWN_S:
+                        cv2.imwrite(str(crack_dir / f"{ts}.jpg"), annotated)
+                        print(f"[{ts}]  *** CRACK ***  ({n_lines} line{'s' if n_lines != 1 else ''})  -> cracks/{ts}.jpg")
+                        last_crack_save = now
 
-            if show:
-                cv2.imshow("ESP32-CAM detector  (q to quit)", annotated)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
+                        if tg_token and tg_chat and now - last_tg_send >= TELEGRAM_COOLDOWN_S:
+                            ok, jpg = cv2.imencode(".jpg", annotated)
+                            if ok and telegram_send_photo(
+                                tg_token, tg_chat, jpg.tobytes(),
+                                caption=f"Crack detected — {n_lines} line(s) at {ts}",
+                            ):
+                                print(f"           telegram alert sent")
+                                last_tg_send = now
+
+                    if show:
+                        cv2.imshow("ESP32-CAM detector  (q to quit)", annotated)
+                        if cv2.waitKey(1) & 0xFF == ord("q"):
+                            return
+
+            except (requests.RequestException, RuntimeError) as e:
+                print(f"  stream error: {e} — reconnecting in 2s", file=sys.stderr)
+                time.sleep(2.0)
 
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:
-        cap.release()
         if show:
             cv2.destroyAllWindows()
 
