@@ -36,13 +36,25 @@ The whole toolchain auto-installs once you open the project in VS Code. There's 
 
 ### One-time installs
 
-1. **VS Code** — https://code.visualstudio.com/
-2. **PlatformIO IDE extension** — inside VS Code: Extensions tab (Ctrl+Shift+X) → search "PlatformIO IDE" → Install. First launch downloads ~600 MB of toolchains (Espressif compiler, esptool, etc.) — this is a one-time thing and takes a few minutes.
-3. **USB-to-serial driver** for whatever FTDI chip you have. Find your COM port in Device Manager after plugging the FTDI in — if it appears as "USB Serial Port", you're already good. Otherwise:
-   - FT232RL → usually auto-installed by Windows. If not: https://ftdichip.com/drivers/vcp-drivers/
-   - CH340G → https://sparks.gogo.co.nz/ch340.html
-   - CP2102 → https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers
-4. **Git** — https://git-scm.com/ — only if you don't have it.
+Everything you need to download once. Estimated time: 30–60 minutes total (most of it is just waiting for installs to finish).
+
+| # | What | Why | Link |
+|---|---|---|---|
+| 1 | **VS Code** | The editor we'll use for both the C++ firmware and the Python server. | https://code.visualstudio.com/ |
+| 2 | **PlatformIO IDE extension** for VS Code | Builds and flashes the firmware. Open VS Code → Extensions tab (Ctrl+Shift+X) → search "PlatformIO IDE" → Install. First launch downloads ~600 MB of toolchains (Espressif compiler, esptool, etc.). One-time cost, takes ~5 min. | (in-app) |
+| 3 | **Python 3.10 or newer** | Runs the crack-detection server, Telegram alerts, and ML training. Make sure you tick "Add Python to PATH" during the Windows installer. | https://www.python.org/downloads/ |
+| 4 | **Git** | To clone the repo. Skip if you already have it. | https://git-scm.com/ |
+| 5 | **USB-to-serial driver** for your FTDI chip | The FTDI is needed only for the very first firmware flash. After that, OTA. Most FTDI chips work out of the box on Windows 10/11; if Device Manager shows "USB Serial Port" when you plug it in, you're done. Otherwise install per chip:<br>FT232RL → https://ftdichip.com/drivers/vcp-drivers/<br>CH340G → https://sparks.gogo.co.nz/ch340.html<br>CP2102 → https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers | (chip-specific) |
+
+Verify each install in a terminal:
+
+```powershell
+code --version          # VS Code
+python --version        # should be 3.10+
+git --version
+```
+
+PlatformIO is verified inside VS Code (alien-head icon in the left sidebar appears once the extension is installed).
 
 ### Clone and open
 
@@ -62,7 +74,66 @@ The PlatformIO sidebar (the alien-head icon in the left rail) shows two environm
 - **Every time after**: cam stays on its WiFi → expand `esp32cam_ota` → click **Upload**. No cable.
 - **Watching serial logs**: expand `esp32cam` → click **Monitor**. (FTDI must be plugged in for serial.)
 
-That's the whole development loop.
+That's the whole development loop **for the firmware**. The Python detector server has its own setup below.
+
+## Setting up the Python detector server
+
+This is where the crack detection, image saving, and Telegram alerts happen. It runs on your laptop, not on the ESP32. The cam streams frames over WiFi → this server processes them.
+
+### One-time setup
+
+From the repo root, open a terminal:
+
+```powershell
+cd server
+python -m venv .venv
+```
+
+That creates a local Python virtual environment at `server/.venv/` — a self-contained sandbox so this project's Python dependencies don't pollute (or get polluted by) your system Python.
+
+Activate the venv. On Windows PowerShell:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+(If PowerShell complains about execution policy, run once: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` and accept the prompt. Then re-run the Activate line.)
+
+Your prompt should now show `(.venv)` at the start — that means you're in the venv.
+
+Install dependencies:
+
+```powershell
+pip install -r requirements.txt
+```
+
+This pulls `opencv-python`, `numpy`, and `requests` — the only runtime dependencies. Takes ~30 seconds.
+
+### Create your Telegram bot (optional but recommended)
+
+To get crack alerts pushed to your phone, you need a Telegram bot. The full step-by-step (with BotFather, getting the chat ID, etc.) is in [`server/README.md`](server/README.md#1b-create-your-telegram-bot-3-minutes-on-your-phone).
+
+Short version:
+1. In Telegram, talk to `@BotFather` → `/newbot` → get a token.
+2. Send your new bot a message.
+3. Visit `https://api.telegram.org/bot<TOKEN>/getUpdates` in a browser → find your chat ID.
+4. Copy `server/secrets.example.json` to `server/secrets.json` and paste in your token + chat ID.
+
+`secrets.json` is gitignored — it stays on your machine only.
+
+### Run the detector
+
+Make sure your laptop is on the **same WiFi** as the ESP32-CAM, then:
+
+```powershell
+.\.venv\Scripts\python.exe detector.py
+```
+
+Within ~2 seconds your phone gets a Telegram push: *"ESP32-CAM detector starting up."* The OpenCV preview window opens showing the live stream with detection overlays. Point the cam at a wall — when something crack-shaped is detected, your phone pings with the annotated photo.
+
+Press **`q`** in the preview window (or **Ctrl+C** in the terminal) to stop.
+
+For all run modes, detection-pipeline details, threshold tuning, and ML training, see [`server/README.md`](server/README.md).
 
 ## Alternative: Arduino IDE
 
