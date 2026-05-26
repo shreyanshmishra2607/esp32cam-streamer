@@ -4,6 +4,8 @@ Live MJPEG stream from an AI-Thinker ESP32-CAM, with a browser-based control pan
 
 ## What it does
 
+**On the ESP32-CAM (firmware):**
+
 - Live video stream over WiFi, viewable in any browser.
 - Snapshot capture endpoint (`/capture`).
 - On-page controls: resolution, JPEG quality, brightness, contrast, saturation, horizontal-mirror, vertical-flip.
@@ -11,6 +13,15 @@ Live MJPEG stream from an AI-Thinker ESP32-CAM, with a browser-based control pan
 - Stable hostname via mDNS at `http://esp32cam.local/` — no chasing IPs.
 - Wireless firmware updates after the first cable flash.
 - "Change WiFi" button to reset saved credentials remotely.
+- `/stats` endpoint with chip temp, free RAM, RSSI, uptime.
+
+**On a laptop (Python server, [`server/`](server/)):**
+
+- Real-time crack detection pipeline using OpenCV (Canny + Hough lines + axis filter + ROI mask + darkness check).
+- Push alerts to your phone via a Telegram bot when a crack is detected — with the annotated photo attached.
+- Optional second-pass ML classifier (MobileNetV3-Small, transfer-learned on the Kaggle Surface Crack Detection dataset).
+
+See [`server/README.md`](server/README.md) for the full Telegram bot setup, detection-pipeline tuning, and ML training instructions.
 
 ## Hardware
 
