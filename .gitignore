@@ -11,4 +11,5 @@ shreyansh-*-research.md
 server/.venv/
 server/captures/
 server/__pycache__/
+server/secrets.json
 **/*.pyc

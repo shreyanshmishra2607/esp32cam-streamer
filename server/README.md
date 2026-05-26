@@ -15,35 +15,41 @@ pip install -r requirements.txt
 
 ## Run
 
-Default config (cam at `http://esp32cam.local/capture`, polling every 3 s):
+Default: live MJPEG stream + preview window (smooth, ~15 fps):
 
 ```powershell
 .venv\Scripts\python.exe detector.py
 ```
 
-With a live preview window:
+Headless (no preview window):
 
 ```powershell
-.venv\Scripts\python.exe detector.py --show
+.venv\Scripts\python.exe detector.py --no-show
 ```
 
-Custom URL (if mDNS doesn't resolve, use the IP from the cam's serial log or `/stats` endpoint):
+Polling mode (one frame every 3 s — old slow behavior, useful for debugging):
 
 ```powershell
-.venv\Scripts\python.exe detector.py --url http://192.168.1.45/capture --interval 2
+.venv\Scripts\python.exe detector.py --poll --interval 3
+```
+
+Custom URL (if mDNS doesn't resolve, use the IP from the cam's serial log or `/stats` endpoint). Pass the **base** URL, no path:
+
+```powershell
+.venv\Scripts\python.exe detector.py --url http://192.168.1.45
 ```
 
 Press **`q`** in the preview window or **Ctrl+C** in the terminal to stop.
 
 ## What it does
 
-Each loop iteration:
+In default streaming mode:
 
-1. HTTP-GETs one JPEG from the camera.
-2. Saves it raw to `captures/raw/<timestamp>.jpg`.
-3. Converts to grayscale → Gaussian blur → Canny edges → Hough line segments.
-4. Keeps only line segments longer than `MIN_LINE_LENGTH` (default 80 px).
-5. If at least `MIN_LINES_FOR_CRACK` qualifying lines exist (default 1), the frame is flagged. The annotated version (red lines overlaid) is saved to `captures/cracks/<timestamp>.jpg` and a `*** CRACK ***` line is printed.
+1. Opens an MJPEG connection to `<url>:81/stream` (the cam's stream endpoint).
+2. Pulls frames at the camera's frame rate (~15 fps).
+3. On each frame: grayscale → Gaussian blur → Canny edges → Hough line segments → keep segments longer than `MIN_LINE_LENGTH` (default 80 px).
+4. Archives a raw frame at most every `RAW_SAVE_EVERY_S` seconds (default 2 s) so disk doesn't fill.
+5. If `MIN_LINES_FOR_CRACK` (default 1) qualifying lines are present, the frame is flagged and the annotated version (red lines) is saved to `captures/cracks/`. A `CRACK_COOLDOWN_S` (default 1.5 s) cooldown prevents spam-saving the same crack frame-after-frame.
 
 ## Tuning the detector
 
